@@ -1,26 +1,22 @@
-# Arch Hyprland Base
+# Arch Hyprland Base (Dual-Boot Safe)
 
-This repository provides a stable, reproducible, and idempotent infrastructure layer for Hyprland on Arch Linux.
+This repository provides a stable, reproducible infrastructure layer for Hyprland on Arch Linux, designed with strict safety rules for dual-booting with Windows.
 
-## Purpose
+## Dual Boot Safety Design
 
-The goal of this project is to prepare the system for a Wayland-based environment without applying any specific UI customizations or themes. It serves as a solid foundation ("Contract") for higher-level layers like Celestia.
+This installer is designed for systems where Windows is already present. It follows these strict rules:
+1. **Reuse EFI**: It detects and reuses the existing Windows EFI partition. It **never** formats it.
+2. **No Partitioning**: It expects an existing partition labeled `ARCH_ROOT` to be used as the root filesystem.
+3. **GRUB Integration**: It uses `os-prober` to detect Windows and adds it to the GRUB boot menu automatically, while preserving the Windows Boot Manager.
+4. **Idempotency**: Every step is safe to rerun.
 
-## Features
+## Installation Requirements
 
-- **Idempotent**: Safe to run multiple times without breaking the system.
-- **Service Ordering**: Configures Systemd user services for PipeWire and Wayland portals to avoid race conditions.
-- **Environment Contract**: Creates `/etc/hypr-base.conf` to signal system readiness.
-- **Automated Fixes**: Automatically refreshes keyrings and fixes common permission issues.
+- **ARCH_ROOT**: Your Linux root partition must have the label `ARCH_ROOT`.
+- **Windows EFI**: A partition containing `/EFI/Microsoft` must exist on the disk.
+- **Internet**: Required for package installation and keyring updates.
 
 ## Usage
-
-### Prerequisites
-
-- A fresh or existing Arch Linux installation.
-- Internet connectivity.
-
-### Installation
 
 ```bash
 git clone https://github.com/IKInecro/arch-hypr-base.git
@@ -30,26 +26,24 @@ sudo ./install.sh
 
 ## Repository Structure
 
-- `install.sh`: Main installation logic.
-- `packages.txt`: List of essential packages.
-- `config/`: Pre-configured infrastructure settings.
-- `environment/`: Wayland and session environment variables.
-- `systemd-user/`: Optimized Systemd user service units.
-- `scripts/`: Helper scripts for maintenance and validation.
+- `install.sh`: The core dual-boot safe installation logic.
+- `packages.txt`: Infrastructure package manifest including bootloader tools.
+- `config/`: System configuration templates.
+- `environment/`: Wayland session variables.
+- `systemd-user/`: User-level service orchestration for PipeWire and Portals.
+- `scripts/`: Validation tools for post-install checks.
 
 ## Integration with Celestia
 
-Layers like Celestia can verify the readiness of the system by checking for the existence and values of the contract file:
+Higher-level layers can verify environment readiness and dual-boot safety by reading `/etc/hypr-base.conf`:
 
 ```bash
-if [[ -f /etc/hypr-base.conf ]]; then
-    source /etc/hypr-base.conf
-    if [[ \$HYPR_BASE_INSTALLED -eq 1 ]]; then
-        echo "Base environment is ready for UI customization."
-    fi
+source /etc/hypr-base.conf
+if [[ $DUAL_BOOT_SAFE -eq 1 ]]; then
+    # Proceed with UI customization
 fi
 ```
 
 ## Logging
 
-Full installation logs are available at `/var/log/hypr-base-install.log`.
+Full details of the installation process are logged to `/var/log/hypr-base-install.log`.
