@@ -1,182 +1,86 @@
 #!/bin/bash
 
 # Configuration
-LOG_FILE="/var/log/hypr-base-install.log"
-CONTRACT_FILE="/etc/hypr-base.conf"
+LOG_FILE="/mnt/var/log/hypr-base-install.log"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PACKAGES_FILE="$SCRIPT_DIR/packages.txt"
 
-# Colors for output
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Ensure log file exists and is writable
-sudo touch "$LOG_FILE"
-sudo chmod 666 "$LOG_FILE"
+msg() { echo -e "${GREEN}[*] ${1}${NC}"; }
+err() { echo -e "${RED}[!] ${1}${NC}"; exit 1; }
 
-log() {
-    local level=$1
-    local msg=$2
-    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
-    echo -e "${timestamp} [${level}] ${msg}" | tee -a "$LOG_FILE"
-}
+# 1. VALIDATION
+msg "Starting validation..."
 
-info() { log "INFO" "${GREEN}${1}${NC}"; }
-warn() { log "WARN" "${YELLOW}${1}${NC}"; }
-error() { log "ERROR" "${RED}${1}${NC}"; exit 1; }
+# Detect ARCH_ROOT
+ROOT_PART=$(blkid -L ARCH_ROOT)
+if [ -z "$ROOT_PART" ]; then
+    err "ARCH_ROOT partition not found. Please label your target partition as ARCH_ROOT."
+fi
+msg "Detected ARCH_ROOT: $ROOT_PART"
 
-# 1. Verification & Security Checks
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        error "This script must be run as root or with sudo."
-    fi
-}
-
-validate_partitions() {
-    info "Validating partition structure..."
-    
-    # 1. Check ARCH_ROOT
-    local root_part=$(blkid -L ARCH_ROOT)
-    if [[ -z "$root_part" ]]; then
-        error "Could not find partition with label ARCH_ROOT. Please label your Linux partition correctly."
-    fi
-
-    local current_root=$(findmnt -nvo SOURCE /)
-    if [[ "$root_part" != "$current_root" ]]; then
-        error "Current / is NOT mounted from ARCH_ROOT ($root_part vs $current_root)."
-    fi
-    info "ARCH_ROOT detected and correctly mounted at /."
-
-    # 2. Find Windows EFI
-    info "Searching for existing Windows EFI partition..."
-    local efi_part=""
-    for part in $(lsblk -lno NAME,TYPE | grep part | awk '{print "/dev/"$1}'); do
-        if mount "$part" /mnt &>/dev/null; then
-            if [[ -d "/mnt/EFI/Microsoft" ]]; then
-                efi_part="$part"
-                umount /mnt
-                break
-            fi
-            umount /mnt
+# Detect Windows EFI
+EFI_PART=""
+for part in $(lsblk -lno NAME,TYPE | grep part | awk '{print "/dev/"$1}'); do
+    if mount "$part" /mnt_efi_check 2>/dev/null || mount "$part" /mnt 2>/dev/null; then
+        MOUNT_POINT=$(findmnt -nvo TARGET "$part")
+        if [ -d "$MOUNT_POINT/EFI/Microsoft" ]; then
+            EFI_PART="$part"
+            umount "$MOUNT_POINT"
+            break
         fi
-    done
-
-    if [[ -z "$efi_part" ]]; then
-        error "Existing EFI partition with Windows Boot Manager not found."
+        umount "$MOUNT_POINT"
     fi
-    info "Found Windows EFI partition at $efi_part."
+done
 
-    # 3. Handle EFI mount
-    if ! findmnt -nvo TARGET /boot/efi &>/dev/null; then
-        info "Mounting $efi_part to /boot/efi..."
-        mkdir -p /boot/efi
-        mount "$efi_part" /boot/efi || error "Failed to mount EFI partition."
-    else
-        local mounted_efi=$(findmnt -nvo SOURCE /boot/efi)
-        if [[ "$mounted_efi" != "$efi_part" ]]; then
-            error "Another partition is already mounted at /boot/efi ($mounted_efi)."
-        fi
-    fi
-}
+# Cleanup if mnt_efi_check was used
+[ -d /mnt_efi_check ] && rmdir /mnt_efi_check
 
-# 2. System Readiness
-check_internet() {
-    info "Checking internet connectivity..."
-    if ! ping -c 1 google.com &>/dev/null; then
-        error "No internet connection detected."
-    fi
-}
+if [ -z "$EFI_PART" ]; then
+    err "Windows EFI partition not found or does not contain 'Microsoft' folder."
+fi
+msg "Detected Windows EFI: $EFI_PART"
 
-refresh_keyring() {
-    info "Refreshing pacman keyring..."
-    pacman -Sy --needed --noconfirm archlinux-keyring >> "$LOG_FILE" 2>&1
-    pacman-key --init >> "$LOG_FILE" 2>&1
-    pacman-key --populate archlinux >> "$LOG_FILE" 2>&1
-}
+# 2. MOUNTING
+msg "Mounting partitions..."
+mount "$ROOT_PART" /mnt || err "Failed to mount ARCH_ROOT"
+mkdir -p /mnt/boot/efi
+mount "$EFI_PART" /mnt/boot/efi || err "Failed to mount EFI partition"
 
-# 3. Idempotent Installation
-install_packages() {
-    info "Installing base packages..."
-    local pkgs=()
-    while IFS= read -r line; do
-        [[ "$line" =~ ^#.*$ ]] || [[ -z "$line" ]] && continue
-        pkgs+=("$line")
-    done < "$PACKAGES_FILE"
+# Setup logging
+mkdir -p /mnt/var/log
+touch "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
 
-    local to_install=()
-    for pkg in "${pkgs[@]}"; do
-        if ! pacman -Qi "$pkg" &>/dev/null; then
-            to_install+=("$pkg")
-        fi
-    done
+msg "Partitions mounted. Logging to $LOG_FILE"
 
-    if [[ ${#to_install[@]} -gt 0 ]]; then
-        pacman -S --needed --noconfirm "${to_install[@]}" >> "$LOG_FILE" 2>&1
-    fi
-}
+# 3. BASE ARCH INSTALL
+msg "Installing base system and packages..."
+# Combine packages from packages.txt
+PACKAGES=$(grep -v '^#' "$PACKAGES_FILE" | xargs)
 
-# 4. GRUB Configuration (Dual Boot Safe)
-setup_grub() {
-    info "Configuring GRUB for dual boot safety..."
-    
-    # Enable os-prober
-    if ! grep -q "GRUB_DISABLE_OS_PROBER=false" /etc/default/grub; then
-        echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
-    fi
+pacstrap -K /mnt $PACKAGES || err "pacstrap failed"
 
-    # Install GRUB
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Arch-Hypr-Base >> "$LOG_FILE" 2>&1
-    
-    # Generate config
-    grub-mkconfig -o /boot/grub/grub.cfg >> "$LOG_FILE" 2>&1
-}
+msg "Generating fstab..."
+genfstab -U /mnt >> /mnt/etc/fstab
 
-# 5. Services & Contract
-setup_services() {
-    info "Enabling essential services..."
-    systemctl enable --now NetworkManager >> "$LOG_FILE" 2>&1
-}
+# Copy chroot script
+mkdir -p /mnt/opt/arch-hypr
+cp -r "$SCRIPT_DIR"/* /mnt/opt/arch-hypr/
+chmod +x /mnt/opt/arch-hypr/scripts/chroot-setup.sh
 
-create_contract() {
-    info "Creating environment contract..."
-    cat <<EOF > "$CONTRACT_FILE"
-HYPR_BASE_INSTALLED=1
-PIPEWIRE_READY=1
-WAYLAND_ENV_READY=1
-DUAL_BOOT_SAFE=1
-EOF
-}
+# 4-7. CHROOT CONFIGURATION
+msg "Entering chroot configuration..."
+arch-chroot /mnt /opt/arch-hypr/scripts/chroot-setup.sh || err "Chroot configuration failed"
 
-# 6. Validation
-validate_all() {
-    info "Validation Phase Starting..."
-    local failed=0
+# 8. LOGGING & CLEANUP
+msg "Finalizing installation..."
+# The chroot script should have handled the contract and services
 
-    [[ -f "/boot/efi/EFI/Microsoft/Boot/bootmgfw.efi" ]] || { warn "Windows Boot Manager not found in EFI."; failed=1; }
-    [[ -f "$CONTRACT_FILE" ]] || { warn "Contract file missing."; failed=1; }
-    command -v hyprland &>/dev/null || { warn "Hyprland not installed."; failed=1; }
-    grep -q "os-prober" /boot/grub/grub.cfg || warn "Windows might not be in GRUB menu. Check os-prober output."
-
-    if [[ $failed -eq 0 ]]; then
-        info "System validated as Dual-Boot Safe."
-    else
-        warn "Validation completed with warnings."
-    fi
-}
-
-main() {
-    check_root
-    validate_partitions
-    check_internet
-    refresh_keyring
-    install_packages
-    setup_grub
-    setup_services
-    create_contract
-    validate_all
-    info "Installation Complete. Check $LOG_FILE for details."
-}
-
-main "$@"
+# 9. FINAL MESSAGE
+msg "Installation complete. Reboot and login as JAWA."
