@@ -1,0 +1,12 @@
+[Unit]
+Description=Multimedia Service Session Manager
+After=pipewire.service
+Requires=pipewire.service
+
+[Service]
+ExecStart=/usr/bin/wireplumber
+Restart=on-failure
+Slice=session.slice
+
+[Install]
+WantedBy=default.target

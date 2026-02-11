@@ -1,0 +1,11 @@
+[Unit]
+Description=PipeWire Multimedia Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/pipewire
+Restart=on-failure
+Slice=session.slice
+
+[Install]
+WantedBy=default.target

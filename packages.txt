@@ -1,0 +1,27 @@
+# Hyprland Core
+hyprland
+waybar
+kitty
+rofi-wayland
+
+# Audio (PipeWire)
+pipewire
+pipewire-alsa
+pipewire-pulse
+pipewire-jack
+wireplumber
+
+# Portal
+xdg-desktop-portal-hyprland
+xdg-desktop-portal-gtk
+
+# System
+networkmanager
+polkit-kde-agent
+qt5-wayland
+qt6-wayland
+
+# Fonts
+noto-fonts
+ttf-font-awesome
+ttf-jet-brains-mono-nerd

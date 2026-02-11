@@ -1,0 +1,14 @@
+[Unit]
+Description=Portal service (Hyprland implementation)
+After=pipewire.service wireplumber.service
+Requires=pipewire.service wireplumber.service
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.hyprland
+ExecStart=/usr/lib/xdg-desktop-portal-hyprland
+Restart=on-failure
+Slice=session.slice
+
+[Install]
+WantedBy=default.target
