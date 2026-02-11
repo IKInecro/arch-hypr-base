@@ -4,6 +4,13 @@ waybar
 kitty
 rofi-wayland
 
+# Bootloader (Dual Boot Safe)
+grub
+efibootmgr
+os-prober
+dosfstools
+mtools
+
 # Audio (PipeWire)
 pipewire
 pipewire-alsa
