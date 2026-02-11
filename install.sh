@@ -27,23 +27,68 @@ info() { log "INFO" "${GREEN}${1}${NC}"; }
 warn() { log "WARN" "${YELLOW}${1}${NC}"; }
 error() { log "ERROR" "${RED}${1}${NC}"; exit 1; }
 
-# 1. Root Check
+# 1. Verification & Security Checks
 check_root() {
-    info "Checking for root privileges..."
     if [[ $EUID -ne 0 ]]; then
         error "This script must be run as root or with sudo."
     fi
 }
 
-# 2. Internet Check
-check_internet() {
-    info "Checking internet connectivity..."
-    if ! ping -c 1 google.com &>/dev/null; then
-        error "No internet connection detected. Please check your network."
+validate_partitions() {
+    info "Validating partition structure..."
+    
+    # 1. Check ARCH_ROOT
+    local root_part=$(blkid -L ARCH_ROOT)
+    if [[ -z "$root_part" ]]; then
+        error "Could not find partition with label ARCH_ROOT. Please label your Linux partition correctly."
+    fi
+
+    local current_root=$(findmnt -nvo SOURCE /)
+    if [[ "$root_part" != "$current_root" ]]; then
+        error "Current / is NOT mounted from ARCH_ROOT ($root_part vs $current_root)."
+    fi
+    info "ARCH_ROOT detected and correctly mounted at /."
+
+    # 2. Find Windows EFI
+    info "Searching for existing Windows EFI partition..."
+    local efi_part=""
+    for part in $(lsblk -lno NAME,TYPE | grep part | awk '{print "/dev/"$1}'); do
+        if mount "$part" /mnt &>/dev/null; then
+            if [[ -d "/mnt/EFI/Microsoft" ]]; then
+                efi_part="$part"
+                umount /mnt
+                break
+            fi
+            umount /mnt
+        fi
+    done
+
+    if [[ -z "$efi_part" ]]; then
+        error "Existing EFI partition with Windows Boot Manager not found."
+    fi
+    info "Found Windows EFI partition at $efi_part."
+
+    # 3. Handle EFI mount
+    if ! findmnt -nvo TARGET /boot/efi &>/dev/null; then
+        info "Mounting $efi_part to /boot/efi..."
+        mkdir -p /boot/efi
+        mount "$efi_part" /boot/efi || error "Failed to mount EFI partition."
+    else
+        local mounted_efi=$(findmnt -nvo SOURCE /boot/efi)
+        if [[ "$mounted_efi" != "$efi_part" ]]; then
+            error "Another partition is already mounted at /boot/efi ($mounted_efi)."
+        fi
     fi
 }
 
-# 3. Refresh Pacman Keyring
+# 2. System Readiness
+check_internet() {
+    info "Checking internet connectivity..."
+    if ! ping -c 1 google.com &>/dev/null; then
+        error "No internet connection detected."
+    fi
+}
+
 refresh_keyring() {
     info "Refreshing pacman keyring..."
     pacman -Sy --needed --noconfirm archlinux-keyring >> "$LOG_FILE" 2>&1
@@ -51,13 +96,9 @@ refresh_keyring() {
     pacman-key --populate archlinux >> "$LOG_FILE" 2>&1
 }
 
-# 4. Install Missing Packages
+# 3. Idempotent Installation
 install_packages() {
-    info "Installing required packages..."
-    if [[ ! -f "$PACKAGES_FILE" ]]; then
-        error "Packages file not found at $PACKAGES_FILE"
-    fi
-
+    info "Installing base packages..."
     local pkgs=()
     while IFS= read -r line; do
         [[ "$line" =~ ^#.*$ ]] || [[ -z "$line" ]] && continue
@@ -72,94 +113,70 @@ install_packages() {
     done
 
     if [[ ${#to_install[@]} -gt 0 ]]; then
-        info "Installing: ${to_install[*]}"
         pacman -S --needed --noconfirm "${to_install[@]}" >> "$LOG_FILE" 2>&1
-    else
-        info "All packages are already installed."
     fi
 }
 
-# 5. Enable Services
-setup_services() {
-    info "Setting up system services..."
-    local services=("NetworkManager")
-    for svc in "${services[@]}"; do
-        systemctl enable --now "$svc" >> "$LOG_FILE" 2>&1
-    done
+# 4. GRUB Configuration (Dual Boot Safe)
+setup_grub() {
+    info "Configuring GRUB for dual boot safety..."
+    
+    # Enable os-prober
+    if ! grep -q "GRUB_DISABLE_OS_PROBER=false" /etc/default/grub; then
+        echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
+    fi
+
+    # Install GRUB
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Arch-Hypr-Base >> "$LOG_FILE" 2>&1
+    
+    # Generate config
+    grub-mkconfig -o /boot/grub/grub.cfg >> "$LOG_FILE" 2>&1
 }
 
-# 6. Create Environment Contract
+# 5. Services & Contract
+setup_services() {
+    info "Enabling essential services..."
+    systemctl enable --now NetworkManager >> "$LOG_FILE" 2>&1
+}
+
 create_contract() {
-    info "Creating environment contract at $CONTRACT_FILE..."
+    info "Creating environment contract..."
     cat <<EOF > "$CONTRACT_FILE"
 HYPR_BASE_INSTALLED=1
 PIPEWIRE_READY=1
 WAYLAND_ENV_READY=1
+DUAL_BOOT_SAFE=1
 EOF
-    chmod 644 "$CONTRACT_FILE"
 }
 
-# 7. Auto Fix Permissions
-fix_permissions() {
-    info "Fixing common permission issues..."
-    # Ensure user is in necessary groups if they were just created (not applicable for root script usually, but good practice)
-    # Most users should be in 'video' and 'audio'
-    local real_user=${SUDO_USER:-$USER}
-    if [[ "$real_user" != "root" ]]; then
-        usermod -aG video,audio,input "$real_user" >> "$LOG_FILE" 2>&1
-    fi
-}
-
-# 8. Validation Phase
-validate_install() {
-    info "Starting validation phase..."
+# 6. Validation
+validate_all() {
+    info "Validation Phase Starting..."
     local failed=0
 
-    # Check Hyprland
-    if ! command -v hyprland &>/dev/null; then
-        warn "Hyprland binary not found in PATH."
-        failed=1
-    fi
-
-    # Check PipeWire
-    if ! pacman -Qi pipewire &>/dev/null; then
-        warn "PipeWire package is not installed."
-        failed=1
-    fi
-
-    # Check Contract
-    if [[ ! -f "$CONTRACT_FILE" ]]; then
-        warn "Contract file missing."
-        failed=1
-    fi
-
-    # Check Env Vars (Basic check if they would exist)
-    if [[ ! -f "$SCRIPT_DIR/environment/wayland.conf" ]]; then
-        warn "Environment configuration file missing."
-        failed=1
-    fi
+    [[ -f "/boot/efi/EFI/Microsoft/Boot/bootmgfw.efi" ]] || { warn "Windows Boot Manager not found in EFI."; failed=1; }
+    [[ -f "$CONTRACT_FILE" ]] || { warn "Contract file missing."; failed=1; }
+    command -v hyprland &>/dev/null || { warn "Hyprland not installed."; failed=1; }
+    grep -q "os-prober" /boot/grub/grub.cfg || warn "Windows might not be in GRUB menu. Check os-prober output."
 
     if [[ $failed -eq 0 ]]; then
-        info "Installation validated successfully."
+        info "System validated as Dual-Boot Safe."
     else
-        warn "Validation completed with warnings. Check the log for details."
+        warn "Validation completed with warnings."
     fi
 }
 
-# Main Execution
 main() {
-    info "Starting Hyprland Base Installation..."
-    
     check_root
+    validate_partitions
     check_internet
     refresh_keyring
     install_packages
+    setup_grub
     setup_services
-    fix_permissions
     create_contract
-    validate_install
-
-    info "Installation finished. Log saved to $LOG_FILE"
+    validate_all
+    info "Installation Complete. Check $LOG_FILE for details."
 }
 
 main "$@"
